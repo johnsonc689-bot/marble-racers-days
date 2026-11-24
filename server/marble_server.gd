@@ -3,15 +3,21 @@ extends SceneTree
 ## It keeps everyone's player name, who's online, party invites, friends' leaderboard times,
 ## and it introduces party members' browsers to each other. There are NO party codes:
 ## a party is found by its host's player (that's what an invite carries). Once introduced,
-## browsers race directly with each other (WebRTC); races never go through this server.
+## browsers race directly with each other (WebRTC). A player whose browser can't reach the
+## host directly (phones, strict home routers) has their party traffic passed on by this
+## server instead ("relay"), only ever to members of their own party.
 ##
 ## Run:  godot --headless --script marble_server.gd -- --port=9080 [--data=/path/to/folder]
 ##
 ## Messages are JSON text over a WebSocket.
 ##   Questions:  {"t":"ask","rid":7,"op":"register","code":..,"name":..}  ->  {"t":"ans","rid":7,"r":...}
+##               (after "hello" the server also says what it can do: {"t":"caps","relay":true,"v":2})
 ##   Parties:    {"t":"host"}  {"t":"join","host":player}  {"t":"leave"}  {"t":"to","to":id,"data":{}}
 ##               ->  {"t":"room","id":..}  {"t":"peer","id":..}  {"t":"gone","id":..}
 ##                   {"t":"from","from":id,"data":{}}  {"t":"error","msg":..}
+##   Relay:      binary [n: 1 byte][n party ids: 2 bytes each][bytes]  ->  each of them gets
+##               binary [from id: 2 bytes][bytes]
+##   Keep-alive: {"t":"ping"} (ignored; it just keeps the line from looking idle)
 
 const MAX_PER_PARTY := 16
 const ONLINE_SECS := 60.0
@@ -80,7 +86,8 @@ func _process(_delta: float) -> bool:
 		var tcp := _server.take_connection()
 		var from_ip := tcp.get_connected_host()
 		ws.accept_stream(tcp)
-		_conns.append({"ws": ws, "code": "", "party": "", "id": 0, "ip": from_ip, "ip_done": false})
+		_conns.append({"ws": ws, "code": "", "party": "", "id": 0, "ip": from_ip, "ip_done": false,
+				"budget": RELAY_BURST, "budget_at": Time.get_ticks_msec()})
 	for c in _conns.duplicate():
 		var ws: WebSocketPeer = c["ws"]
 		ws.poll()
@@ -90,7 +97,11 @@ func _process(_delta: float) -> bool:
 				c["ip_done"] = true
 				c["ip"] = Geo.real_ip(ws, str(c["ip"]))
 			while ws.get_available_packet_count() > 0:
-				_handle(c, ws.get_packet().get_string_from_utf8())
+				var pkt := ws.get_packet()
+				if ws.was_string_packet():
+					_handle(c, pkt.get_string_from_utf8())
+				else:
+					_relay(c, pkt)
 		elif st == WebSocketPeer.STATE_CLOSED:
 			_conns.erase(c)
 			_leave_party(c)
@@ -112,6 +123,42 @@ func _send(c: Dictionary, msg: Dictionary) -> void:
 	(c["ws"] as WebSocketPeer).send_text(JSON.stringify(msg))
 
 
+# --- Relay: party traffic for players who can't reach the host directly ----------------------
+# Only ever passed to members of the sender's own party. Each connection gets a byte allowance
+# (refilled every second) so one player can't flood the server.
+
+const RELAY_RATE := 600000.0       ## bytes a second, per player
+const RELAY_BURST := 3000000.0     ## a race start (it carries the whole track) can be big
+
+
+func _relay(c: Dictionary, pkt: PackedByteArray) -> void:
+	var p: Dictionary = _parties.get(str(c["party"]), {})
+	var peers: Dictionary = p.get("peers", {})
+	if peers.is_empty() or not is_same(peers.get(int(c["id"])), c) or pkt.size() < 1:
+		return
+	var n := int(pkt[0])
+	if n < 1 or pkt.size() <= 1 + n * 2:
+		return
+	var now := Time.get_ticks_msec()
+	c["budget"] = minf(RELAY_BURST, float(c["budget"]) + (now - int(c["budget_at"])) * RELAY_RATE / 1000.0)
+	c["budget_at"] = now
+	var cost := float(pkt.size() - 1 - n * 2) * n
+	if cost > float(c["budget"]):
+		return   # over the allowance: dropped (the game sends again what matters)
+	c["budget"] = float(c["budget"]) - cost
+	var out := PackedByteArray()
+	out.resize(2)
+	out.encode_u16(0, int(c["id"]))
+	out.append_array(pkt.slice(1 + n * 2))
+	for i in n:
+		var to := pkt.decode_u16(1 + i * 2)
+		if int(c["id"]) != 1 and to != 1:
+			continue   # players only talk to the host (the host passes things on)
+		var target: Variant = peers.get(to)
+		if target != null and not is_same(target, c):
+			(target["ws"] as WebSocketPeer).put_packet(out)
+
+
 func _handle(c: Dictionary, text: String) -> void:
 	var m: Variant = JSON.parse_string(text)
 	if not (m is Dictionary):
@@ -122,6 +169,8 @@ func _handle(c: Dictionary, text: String) -> void:
 	match str(m.get("t", "")):
 		"ask":
 			_send(c, {"t": "ans", "rid": m.get("rid", 0), "r": _answer(c, m)})
+			if str(m.get("op", "")) == "hello":
+				_send(c, {"t": "caps", "relay": true, "v": 2})
 		"host":
 			_host(c)
 		"join":
@@ -199,7 +248,7 @@ func _host(c: Dictionary) -> void:
 	# Anyone who waited for the host to come back meets them again.
 	for id in p["peers"]:
 		if int(id) != 1:
-			_send(c, {"t": "peer", "id": int(id)})
+			_send(c, {"t": "peer", "id": int(id), "name": _name_of(p["peers"][id])})
 			_send(p["peers"][id], {"t": "peer", "id": 1})
 
 
@@ -220,7 +269,12 @@ func _join(c: Dictionary, host: String) -> void:
 	_send(c, {"t": "room", "id": id})
 	if (p["peers"] as Dictionary).has(1):
 		_send(c, {"t": "peer", "id": 1})
-		_send(p["peers"][1], {"t": "peer", "id": id})
+		_send(p["peers"][1], {"t": "peer", "id": id, "name": _name_of(c)})
+
+
+## A player's name (so the host can show "Ann - connecting..." before Ann's game is connected).
+func _name_of(c: Dictionary) -> String:
+	return str((_players.get(str(c["code"]), {}) as Dictionary).get("name", ""))
 
 
 func _leave_party(c: Dictionary) -> void:
@@ -407,6 +461,9 @@ class Geo:
 			_v4 = (saved as Dictionary).get("v4", [])
 			_v6 = (saved as Dictionary).get("v6", [])
 			print("marble server: US/Canada address list loaded from the saved copy (%d blocks)" % (_v4.size() + _v6.size()))
+		if OS.get_cmdline_user_args().has("--offline"):
+			_next_refresh = INF   # local tests: no downloading
+			return
 		_refresh()
 
 	func ready() -> bool:
