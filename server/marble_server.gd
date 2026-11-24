@@ -149,8 +149,9 @@ var _world: Dictionary = {}        ## host player -> {open}: world parties and w
 func _world_queue(c: Dictionary, region_ok: bool) -> void:
 	# The hard lock: the player's internet address must belong to the United States or Canada
 	# (from the internet registries' own lists). Only if those lists couldn't be loaded at all
-	# does the server fall back to the game's own time-zone check.
-	if _geo.ready():
+	# does the server fall back to the game's own time-zone check. The same if the player's real
+	# address is hidden (a tunnel or proxy such as Cloudflare in front that doesn't pass it on).
+	if _geo.ready() and not Geo.is_local(str(c["ip"])):
 		region_ok = _geo.allowed(str(c["ip"]))
 	if not region_ok:
 		_send(c, {"t": "error", "msg": "World races are for players in the United States and Canada."})
